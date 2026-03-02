@@ -104,8 +104,24 @@ class XHSClient:
         driver = self.browser_manager.driver
         
         try:
-            logger.info("🌐 直接访问小红书发布页面...")
-            driver.get("https://creator.xiaohongshu.com/publish/publish?from=menu")
+            # 根据内容类型选择 target 参数，直接导航到对应发布页，跳过 tab 查找
+            has_images = note.images and len(note.images) > 0
+            has_videos = note.videos and len(note.videos) > 0
+            if has_videos:
+                target = "video"
+            elif has_images:
+                target = "image"
+            else:
+                target = "image"  # 默认图文模式
+            publish_url = f"https://creator.xiaohongshu.com/publish/publish?from=menu&target={target}"
+            logger.info(f"🌐 直接访问小红书发布页面（target={target}）: {publish_url}")
+
+            # Set short page load timeout to avoid hanging 5 minutes on slow XHS pages
+            driver.set_page_load_timeout(45)
+            try:
+                driver.get(publish_url)
+            except Exception as e:
+                logger.warning(f"⚠️ 页面加载超时或中断: {e}，检查URL...")
             await asyncio.sleep(5)  # 等待页面基本加载
             
             if "publish" not in driver.current_url:
@@ -114,7 +130,7 @@ class XHSClient:
             logger.info("⏳ 等待页面元素完全渲染...")
             await asyncio.sleep(3)  # 等待页面元素完全渲染
             
-            # 根据内容类型切换发布模式
+            # 模式确认（URL 已带 target，此处仅记录日志）
             await self._switch_publish_mode(note)
             
             # 处理文件上传（图片/视频）
@@ -134,66 +150,15 @@ class XHSClient:
                 raise PublishError(f"发布流程执行失败: {str(e)}", publish_step="流程执行") from e
 
     async def _switch_publish_mode(self, note: XHSNote) -> None:
-        """根据笔记内容类型切换发布模式（图文/视频）"""
-        try:
-            driver = self.browser_manager.driver
-            
-            # 判断内容类型
-            has_images = note.images and len(note.images) > 0
-            has_videos = note.videos and len(note.videos) > 0
-            
-            if has_images:
-                logger.info("🔄 切换到图文发布模式...")
-                # 查找"上传图文"选项卡
-                try:
-                    # 查找所有creator-tab元素
-                    tabs = driver.find_elements(By.CSS_SELECTOR, ".creator-tab")
-                    image_tab = None
-                    
-                    for tab in tabs:
-                        if tab.is_displayed() and "上传图文" in tab.text:
-                            # 确保元素在可见区域内（不是负坐标）
-                            rect = tab.rect
-                            if rect['x'] > 0 and rect['y'] > 0:
-                                image_tab = tab
-                                break
-                    
-                    if image_tab:
-                        image_tab.click()
-                        logger.info("✅ 已切换到图文发布模式")
-                        await asyncio.sleep(2)  # 等待界面切换完成
-                    else:
-                        logger.warning("⚠️ 未找到图文发布选项卡，可能已经在图文模式")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ 切换图文模式时出错: {e}，继续执行...")
-                    
-            elif has_videos:
-                logger.info("🔄 切换到视频发布模式...")
-                # 页面默认就是视频模式，检查是否需要切换
-                try:
-                    tabs = driver.find_elements(By.CSS_SELECTOR, ".creator-tab")
-                    video_tab = None
-                    
-                    for tab in tabs:
-                        if tab.is_displayed() and "上传视频" in tab.text:
-                            rect = tab.rect
-                            if rect['x'] > 0 and rect['y'] > 0:
-                                video_tab = tab
-                                break
-                    
-                    if video_tab and "active" not in video_tab.get_attribute("class"):
-                        video_tab.click()
-                        logger.info("✅ 已切换到视频发布模式")
-                        await asyncio.sleep(2)
-                    else:
-                        logger.info("✅ 已在视频发布模式")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ 切换视频模式时出错: {e}，继续执行...")
-                    
-        except Exception as e:
-            logger.warning(f"⚠️ 模式切换过程出错: {e}，继续执行...")
+        """确认发布模式（URL 已通过 target 参数直接指定，此处仅记录日志）"""
+        has_videos = note.videos and len(note.videos) > 0
+        has_images = note.images and len(note.images) > 0
+        if has_videos:
+            logger.info("✅ 视频发布模式（已通过 URL target=video 直接指定）")
+        elif has_images:
+            logger.info("✅ 图文发布模式（已通过 URL target=image 直接指定）")
+        else:
+            logger.info("✅ 默认图文发布模式")
 
     async def _handle_file_upload(self, note: XHSNote) -> None:
         """统一处理文件上传（图片/视频）"""
@@ -214,6 +179,16 @@ class XHSClient:
                 logger.info(f"🎬 准备上传 {len(note.videos)} 个视频...")
             
             if files_to_upload:
+                # 等待上传组件初始化（XHS 发布页 JS 组件可能需要额外时间）
+                logger.info("⏳ 等待上传组件初始化...")
+                try:
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
+                    )
+                    logger.info("✅ 上传组件已就绪")
+                except Exception:
+                    logger.warning("⚠️ 等待上传组件20秒超时，继续尝试...")
+                
                 # 尝试多个可能的选择器查找上传元素
                 upload_input = None
                 upload_selectors = [
@@ -226,16 +201,14 @@ class XHSClient:
                     "[accept*='video']"
                 ]
                 
-                logger.info("🔍 查找上传元素...")
+                logger.info("🔍 查找上传元素（含隐藏）...")
                 for selector in upload_selectors:
                     try:
                         elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                        for element in elements:
-                            if element.is_displayed():
-                                upload_input = element
-                                logger.info(f"✅ 找到可见的上传元素: {selector}")
-                                break
-                        if upload_input:
+                        if elements:
+                            # file input 通常是隐藏的，不用 is_displayed() 过滤
+                            upload_input = elements[0]
+                            logger.info(f"✅ 找到上传元素: {selector}")
                             break
                     except Exception:
                         continue
@@ -243,14 +216,28 @@ class XHSClient:
                 # 如果还是没找到，用xpath方式
                 if not upload_input:
                     try:
-                        upload_input = driver.find_element(By.XPATH, "//input[@type='file']")
-                        logger.info("✅ 通过XPath找到上传元素")
+                        all_inputs = driver.find_elements(By.XPATH, "//input[@type='file']")
+                        if all_inputs:
+                            upload_input = all_inputs[0]
+                            logger.info(f"✅ 通过XPath找到上传元素（共{len(all_inputs)}个）")
                     except Exception:
-                        logger.error("❌ 无法找到任何文件上传元素")
-                        # 继续执行，可能页面结构已改变
-                        return
-                
-                # 发送文件路径
+                        pass
+
+                if not upload_input:
+                    logger.error("❌ 无法找到任何文件上传元素")
+                    # 继续执行，可能页面结构已改变
+                    return
+
+                # file input 可能隐藏，用 JS 临时暴露再操作
+                try:
+                    driver.execute_script(
+                        "arguments[0].style.display='block'; arguments[0].style.opacity='1';",
+                        upload_input
+                    )
+                except Exception:
+                    pass
+
+                # 发送文件路径（多文件用换行符分隔）
                 upload_input.send_keys('\n'.join(files_to_upload))
                 logger.info("✅ 文件上传指令已发送")
                 
@@ -261,8 +248,16 @@ class XHSClient:
                 if has_video:
                     await self._wait_for_video_upload_complete()
                 else:
-                    # 图片上传给少量时间
-                    await asyncio.sleep(2)
+                    # 图片上传：等待内容编辑器出现（XHS处理上传后才渲染编辑器）
+                    logger.info("⏳ 等待图片上传完成和编辑器渲染...")
+                    try:
+                        WebDriverWait(driver, 30).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "[contenteditable='true']"))
+                        )
+                        logger.info("✅ 内容编辑器已出现")
+                    except Exception:
+                        logger.warning("⚠️ 等待编辑器超时，额外等待5秒...")
+                        await asyncio.sleep(5)
                     
         except Exception as e:
             logger.warning(f"⚠️ 处理文件上传时出错: {e}")
@@ -329,7 +324,7 @@ class XHSClient:
     async def _fill_note_content(self, note: XHSNote) -> None:
         """填写笔记内容"""
         driver = self.browser_manager.driver
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 5)  # 短超时，编辑器应已出现（上传后已等待）
         
         # 初始化content_filler（如果还没初始化）
         if not self.content_filler:
@@ -365,8 +360,28 @@ class XHSClient:
             if not title_input:
                 raise PublishError("无法找到标题输入框", publish_step="查找标题输入框")
             
-            title_input.clear()
-            title_input.send_keys(title)
+            # Click to activate element first (required for contenteditable inputs)
+            try:
+                self.browser_manager.driver.execute_script("arguments[0].click();", title_input)
+            except Exception:
+                title_input.click()
+            await asyncio.sleep(0.5)
+            # Clear the element — use JS fallbacks for contenteditable divs
+            try:
+                title_input.clear()
+            except Exception:
+                try:
+                    self.browser_manager.driver.execute_script(
+                        "arguments[0].value = ''; arguments[0].innerHTML = '';", title_input
+                    )
+                except Exception:
+                    pass
+            # Send keys — use ActionChains as fallback for contenteditable divs
+            try:
+                title_input.send_keys(title)
+            except Exception:
+                from selenium.webdriver.common.action_chains import ActionChains
+                ActionChains(self.browser_manager.driver).click(title_input).send_keys(title).perform()
             logger.info(f"✅ 标题已填写: {title}")
             
         except Exception as e:
@@ -378,7 +393,8 @@ class XHSClient:
             
             # 尝试多个内容选择器（小红书现在使用 Tiptap 编辑器）
             content_selectors = [
-                "[contenteditable='true']",  # Tiptap 编辑器
+                ".tiptap.ProseMirror[contenteditable='true']",  # 最精确（issue #48）
+                "[contenteditable='true']",  # Tiptap 编辑器通用
                 ".tiptap",
                 ".ProseMirror",
                 ".ql-editor",  # 旧版 Quill 编辑器
@@ -402,6 +418,12 @@ class XHSClient:
             if not content_input:
                 raise PublishError("无法找到内容输入框", publish_step="查找内容输入框")
             
+            # Click to activate element first (required for contenteditable inputs)
+            try:
+                self.browser_manager.driver.execute_script("arguments[0].click();", content_input)
+            except Exception:
+                content_input.click()
+            await asyncio.sleep(0.5)
             content_input.clear()
             
             # 处理内容，支持换行
